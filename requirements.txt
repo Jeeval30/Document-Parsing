@@ -9,4 +9,7 @@ asyncpg>=0.29
 pydantic>=2.7
 python-dotenv>=1.0
 httpx>=0.27
+pymupdf>=1.24        # rasterise PDFs to images for the Ollama (local) provider
 pytest>=8
+psycopg2-binary>=2.9
+psycopg[binary]

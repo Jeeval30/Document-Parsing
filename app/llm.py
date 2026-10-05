@@ -1,10 +1,12 @@
 """LLM calls: classify, design a schema for unseen types, and extract.
 
-Two providers, chosen with LLM_PROVIDER (model: LLM_MODEL):
+Three providers, chosen with LLM_PROVIDER (model: LLM_MODEL):
   * anthropic - Claude via the Anthropic SDK (structured outputs via messages.parse)
   * gemini    - Gemini via the google-genai SDK (structured outputs via response_json_schema)
-Both read PDFs and images natively, so no separate OCR step is needed. Everything above _parse()
-is provider-neutral: prompts, schemas and the returned Pydantic objects are the same either way.
+  * ollama    - local Ollama server via /api/chat (structured outputs via a JSON schema `format`)
+Claude and Gemini read PDFs and images natively. Ollama only accepts images, so PDFs are rasterised
+to PNG pages first and the model must be vision-capable. Everything above _parse() is provider-neutral:
+prompts, schemas and the returned Pydantic objects are the same across all three.
 """
 import asyncio
 import base64
@@ -71,6 +73,8 @@ async def _parse(content: list[dict], schema: type[BaseModel], effort: str, max_
     {"type": "text", "text": ...}); the Gemini backend converts them."""
     if config.LLM_PROVIDER == "gemini":
         return await _parse_gemini(content, schema, max_tokens)
+    if config.LLM_PROVIDER == "ollama":
+        return await _parse_ollama(content, schema, max_tokens)
     return await _parse_anthropic(content, schema, effort, max_tokens)
 
 
@@ -151,6 +155,116 @@ async def _parse_gemini(content: list[dict], schema: type[BaseModel], max_tokens
         "model": response.model_version or config.LLM_MODEL,
         "input_tokens": getattr(meta, "prompt_token_count", None),
         "output_tokens": getattr(meta, "candidates_token_count", None),
+    }
+    return parsed, usage
+
+
+# --------------------------------------------------------------------------- Ollama backend
+# Local Ollama server (http://localhost:11434 by default). Uses the native /api/chat endpoint
+# with JSON-schema structured outputs. Ollama only accepts images, so PDFs are rasterised to PNG
+# pages first — the chosen model must be vision-capable. When a PDF carries a real text layer we
+# also pass that text: small local models extract far more reliably from exact characters than by
+# OCR-ing their own render, and the image still supplies layout for tables and totals.
+
+_OLLAMA_RETRIES = 2
+_OLLAMA_PDF_ZOOM = 3.0  # render PDF pages at 3x so small table text stays legible for the vision model
+_OLLAMA_MIN_TEXT_CHARS = 20  # below this a PDF is treated as scanned (no usable text layer)
+
+
+def _pdf_render(pdf_bytes: bytes) -> tuple[list[str], str]:
+    """Return (base64 PNG per page, concatenated text-layer text) for a PDF."""
+    try:
+        import pymupdf  # PyMuPDF (the older `import fitz` name is deprecated)
+    except ImportError as e:
+        raise LLMError(
+            "Ollama needs PDFs converted to images first. Install PyMuPDF: pip install pymupdf."
+        ) from e
+    images, texts = [], []
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        matrix = pymupdf.Matrix(_OLLAMA_PDF_ZOOM, _OLLAMA_PDF_ZOOM)
+        for page in doc:
+            images.append(base64.b64encode(page.get_pixmap(matrix=matrix).tobytes("png")).decode("ascii"))
+            texts.append(page.get_text())
+    return images, "\n".join(texts).strip()
+
+
+def _pdf_to_images_b64(pdf_bytes: bytes) -> list[str]:  # kept for callers/tests that only need images
+    return _pdf_render(pdf_bytes)[0]
+
+
+def _ollama_user_message(content: list[dict]) -> dict:
+    texts, images, pdf_text = [], [], ""
+    for block in content:
+        if block["type"] == "text":
+            texts.append(block["text"])
+        else:
+            src = block["source"]
+            if src["media_type"] == "application/pdf":
+                imgs, extracted = _pdf_render(base64.b64decode(src["data"]))
+                images.extend(imgs)
+                if len(extracted) >= _OLLAMA_MIN_TEXT_CHARS:
+                    pdf_text = extracted
+            else:
+                images.append(src["data"])  # already base64, no data: prefix
+    if pdf_text:
+        texts.append(
+            "Text extracted from the document's text layer (order may be imperfect; use the image "
+            "for layout and to resolve which number belongs to which field):\n"
+            f"-----\n{pdf_text}\n-----"
+        )
+    msg = {"role": "user", "content": "\n\n".join(texts) or "Extract the requested information."}
+    if images:
+        msg["images"] = images
+    return msg
+
+
+async def _parse_ollama(content: list[dict], schema: type[BaseModel], max_tokens: int):
+    payload = {
+        "model": config.LLM_MODEL,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, _ollama_user_message(content)],
+        "format": schema.model_json_schema(),  # structured output (Ollama >= 0.5)
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": max_tokens, "num_ctx": config.OLLAMA_NUM_CTX},
+    }
+    url = f"{config.OLLAMA_HOST}/api/chat"
+    response = None
+    for attempt in range(_OLLAMA_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=config.OLLAMA_TIMEOUT) as http:
+                response = await http.post(url, json=payload)
+            if response.status_code == 404:
+                raise LLMError(
+                    f"Ollama model '{config.LLM_MODEL}' not found. Pull it first: "
+                    f"ollama pull {config.LLM_MODEL}"
+                )
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as e:
+            raise LLMError(f"Ollama API error {e.response.status_code}: {e.response.text[:200]}") from e
+        except (httpx.HTTPError, OSError, TimeoutError) as e:
+            if attempt < _OLLAMA_RETRIES:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise LLMError(
+                f"Could not reach Ollama at {config.OLLAMA_HOST}. Is `ollama serve` running?"
+            ) from e
+
+    data = response.json()
+    if data.get("done_reason") == "length":
+        raise LLMError("Output was cut off (document too long for one pass).")
+    text = (data.get("message") or {}).get("content")
+    if not text:
+        raise LLMError("Model returned no structured output.")
+    try:
+        parsed = schema.model_validate_json(text)
+    except ValidationError as e:
+        log.warning("Ollama output did not match schema: %s", e)
+        raise LLMError("Model output did not match the expected schema.") from e
+
+    usage = {
+        "model": data.get("model") or config.LLM_MODEL,
+        "input_tokens": data.get("prompt_eval_count"),
+        "output_tokens": data.get("eval_count"),
     }
     return parsed, usage
 

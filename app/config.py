@@ -14,22 +14,28 @@ def _bool(name: str, default: bool) -> bool:
 
 
 # Postgres in production, e.g. postgresql+asyncpg://user:pass@localhost:5432/docparse
-# Falls back to a local SQLite file so the app runs with zero setup.
+# Falls back to a local SQLite file so the app runs with zero setup. 
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{BASE_DIR / 'docparse.db'}")
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", BASE_DIR / "uploads"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 
-# LLM provider: "anthropic" (Claude) or "gemini" (Google).
+# LLM provider: "anthropic" (Claude), "gemini" (Google) or "ollama" (local Ollama server).
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
-if LLM_PROVIDER not in {"anthropic", "gemini"}:
-    raise ValueError(f"LLM_PROVIDER must be 'anthropic' or 'gemini', got {LLM_PROVIDER!r}")
-_DEFAULT_MODELS = {"anthropic": "claude-opus-5", "gemini": "gemini-2.5-flash-lite"}
+if LLM_PROVIDER not in {"anthropic", "gemini", "ollama"}:
+    raise ValueError(f"LLM_PROVIDER must be 'anthropic', 'gemini' or 'ollama', got {LLM_PROVIDER!r}")
+_DEFAULT_MODELS = {"anthropic": "claude-opus-5", "gemini": "gemini-2.5-flash", "ollama": "qwen3.5:9b"}
 # LLM_MODEL wins; ANTHROPIC_MODEL is still honoured for the Claude provider.
-LLM_MODEL = (os.getenv("LLM_MODEL") or (os.getenv("ANTHROPIC_MODEL") if LLM_PROVIDER == "anthropic" else None)
+LLM_MODEL = (os.getenv("LLM_MODEL") or (os.getenv("ANTHROPIC_MODEL") if LLM_PROVIDER == "gemini" else None)
              or _DEFAULT_MODELS[LLM_PROVIDER]).strip()
 # Gemini key: GEMINI_API_KEY or GOOGLE_API_KEY. Claude key: ANTHROPIC_API_KEY (read by the SDK).
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+# Ollama: base URL of the local server (no key needed). Default matches a stock Ollama install.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip().rstrip("/")
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "600"))
+# Context window (prompt + output). Ollama defaults to a tiny 4096, which overflows on real
+# documents; raise it here. Bigger = more RAM/VRAM, so lower it if the model won't load.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "32768"))
 
 CLASSIFY_EFFORT = os.getenv("CLASSIFY_EFFORT", "low")
 EXTRACT_EFFORT = os.getenv("EXTRACT_EFFORT", "high")
